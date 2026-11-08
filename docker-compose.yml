@@ -1,0 +1,123 @@
+# Claude Code Web – Docker Compose (allgemeine Variante).
+#
+#   cp .env.example .env        # Werte prüfen/anpassen
+#   docker compose up -d --build
+#   docker compose logs -f      # zeigt beim ersten Start das Einrichtungs-Token
+#
+# Für CasaOS: siehe docker-compose.casaos.yml.
+#
+# Persistenz (benannte Volumes, getrennt nach Zweck):
+#   projects     /data/projects     Projektdateien und Git-Repositories
+#   config       /data/config       Benutzer, Einstellungen, Projektliste (wird nie überschrieben)
+#   credentials  /data/credentials  Hauptschlüssel und verschlüsselte Geheimnisse (API-Schlüssel, Git-Tokens)
+#   sessions     /data/sessions     Terminal-Sitzungen (Verlauf)
+#   logs         /data/logs         Anwendungsprotokolle
+#   home         /home/claude       Claude-Anmeldung (~/.claude), SSH-Schlüssel, ~/.gitconfig, Shell-Verlauf
+#
+#   docker compose down      behält alle Volumes (Daten bleiben)
+#   docker compose down -v   LÖSCHT alle Volumes – vorher scripts/backup.sh ausführen
+
+name: claude-code-web
+
+services:
+  claude-code-web:
+    image: ${IMAGE:-claude-code-web}:${IMAGE_TAG:-latest}
+    container_name: Claude-Code-Web
+    restart: Always
+    stop_grace_period: 30s
+
+    ports:
+      # Standard: nur lokal erreichbar. Für den Zugriff im Netzwerk BIND_ADDRESS=0.0.0.0 setzen
+      # (am besten hinter einem HTTPS-Reverse-Proxy, siehe README).
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+
+    environment:
+      TZ: ${TZ:-UTC}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      # Besitzerkorrektur: Projektordner, die von außen (z. B. als root) angelegt wurden, werden beim Start UND – über den kleinen
+      # Besitzer-Wächter – sofort nach dem Anlegen/Einbinden in der Oberfläche auf PUID:PGID gesetzt (chown -R). false = aus.
+      FIX_PROJECT_OWNERS: ${FIX_PROJECT_OWNERS:-true}
+      FORCE_CHOWN: ${FORCE_CHOWN:-false}
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Anmeldung / Zugriff
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
+      SECRET_KEY: ${SECRET_KEY:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # Domain: Öffentliche Adresse der Oberfläche, z. B. https://claude.example.com (siehe docs/REVERSE-PROXY.md). Leer = Zugriff nur über Host:Port.
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-240}
+      # Claude Code
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      # Automatische Updates von Claude Code: standardmäßig AN. Claude Code liegt in /opt/claude-code (gehört PUID:PGID), dorthin
+      # schreibt der Updater ohne Root-Rechte. Updates gelten bis zum nächsten Neuanlegen des Containers (neues Image).
+      # DISABLE_AUTOUPDATER=1 schaltet sie ab (Version bleibt die des Images).
+      DISABLE_AUTOUPDATER: ${DISABLE_AUTOUPDATER:-}
+      # Vorschau / Terminals
+      PREVIEW_PORT_MIN: ${PREVIEW_PORT_MIN:-3000}
+      PREVIEW_PORT_MAX: ${PREVIEW_PORT_MAX:-9999}
+      TERMINAL_MAX_SESSIONS: ${TERMINAL_MAX_SESSIONS:-20}
+      TERMINAL_MAX_SESSIONS_PER_USER: ${TERMINAL_MAX_SESSIONS_PER_USER:-10}
+      CLAUDE_PASSTHROUGH_ENV: ${CLAUDE_PASSTHROUGH_ENV:-}
+      # Docker (siehe docs/DOCKER.md): Die Anwendung und Claude erreichen Docker NUR über den Docker-Agenten (Dienst „docker-agent“),
+      # nie über den Host-Socket. BuildKit ist über den Agenten nicht freigegeben, daher der klassische Builder.
+      DOCKER_HOST: unix:///run/docker-agent/docker.sock
+      DOCKER_BUILDKIT: "0"
+      COMPOSE_DOCKER_CLI_BUILD: "0"
+      DOCKER_AUDIT_FILE: /run/docker-agent-audit/audit.jsonl
+
+    volumes:
+      - projects:/data/projects
+      - config:/data/config
+      - credentials:/data/credentials
+      - sessions:/data/sessions
+      - logs:/data/logs
+      - home:/home/claude
+      # Socket des Docker-Agenten (kein Host-Socket) und dessen Prüfprotokoll (nur lesend)
+      - docker-agent-socket:/run/docker-agent
+      - docker-agent-audit:/run/docker-agent-audit:ro
+
+    depends_on:
+      docker-agent:
+        condition: service_started
+
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+
+    # Härtung: alle Capabilities entfernen und nur zurückgeben, was der Entrypoint braucht
+    # (Besitzer korrigieren, Benutzer wechseln). Die Anwendung selbst läuft ohne Root-Rechte.
+    # Kein docker.sock in DIESEM Container (nur der Docker-Agent hat ihn), kein privileged, kein Host-Netzwerk.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${PIDS_LIMIT:-2048}
+    mem_limit: ${MEMORY_LIMIT:-4g}
+    cpus: ${CPU_LIMIT:-2.0}
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
